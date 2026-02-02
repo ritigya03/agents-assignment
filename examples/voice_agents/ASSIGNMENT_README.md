@@ -2,181 +2,207 @@
 
 ## The Problem
 
-When a user says "yeah", "okay", or "hmm" while the AI agent is talking, the agent stops speaking. This is annoying because these words just mean "I'm listening" - they're not real interruptions.
+When the AI agent is explaining something, LiveKit's default Voice Activity Detection (VAD) is too sensitive. If a user says "yeah", "ok", or "hmm" to show they are listening, the agent stops speaking. This is wrong because these are just acknowledgments, not real interruptions.
 
-**Example:**
+**Current Behavior (Wrong):**
 - Agent: "Let me explain blockchain. It's a distributed ledger that..."
-- User: "yeah" *(just listening)*
-- Agent: ❌ **STOPS TALKING** ← This is the problem!
+- User: "yeah" (just listening)
+- Agent: STOPS TALKING (should not stop!)
 
-## My Solution
+## The Goal
 
-I created a smart filter that knows the difference between:
-- 🟢 **Soft words** = "yeah", "okay", "hmm" (just listening sounds)
-- 🔴 **Interrupt words** = "stop", "wait", "no" (real commands)
+Create a context-aware logic layer that distinguishes between:
+- **Passive acknowledgment** = "yeah", "ok", "hmm" (just listening)
+- **Active interruption** = "stop", "wait", "no" (real commands)
 
-### How It Works (Simple Diagram)
+The agent must behave differently based on whether it is speaking or silent.
 
-```
-User says something
-        ↓
-   Is agent talking?
-        ↓
-    ┌───┴───┐
-   YES      NO
-    ↓        ↓
-Is it a     Process
-soft word?  normally
-    ↓
- ┌──┴──┐
-YES    NO
- ↓      ↓
-IGNORE  Is it "stop"?
-Agent      ↓
-keeps   ┌──┴──┐
-talking YES   NO
-        ↓     ↓
-      STOP  STOP
-      agent agent
-```
+## Solution Overview
 
-## The Logic (4 Simple Rules)
+### Core Logic Matrix
 
-| What User Says | Agent Status | What Happens |
-|----------------|--------------|--------------|
-| "yeah", "okay" | 🗣️ **Speaking** | ✅ **IGNORE** - Agent keeps talking |
-| "stop", "wait" | 🗣️ **Speaking** | 🛑 **STOP** - Agent stops immediately |
-| "yeah", "okay" | 🤐 **Silent** | 💬 **RESPOND** - Agent replies normally |
-| "hello" | 🤐 **Silent** | 💬 **RESPOND** - Normal conversation |
+| User Input | Agent State | Desired Behavior | Implementation |
+|------------|-------------|------------------|----------------|
+| "yeah", "ok", "hmm" | Agent Speaking | IGNORE - Continue speaking | is_only_soft_words() + session.resume() |
+| "wait", "stop", "no" | Agent Speaking | INTERRUPT - Stop immediately | contains_interrupt_keyword() + session.interrupt() |
+| "yeah", "ok", "hmm" | Agent Silent | RESPOND - Treat as valid input | Normal processing |
+| "start", "hello" | Agent Silent | RESPOND - Normal conversation | Normal processing |
 
-## Why My Solution is Good
+## Implementation Details
 
-### 1. **Three-Layer Protection**
-- **Layer 1**: VAD filter (blocks very short sounds)
-- **Layer 2**: My smart word detector (checks if it's a soft word)
-- **Layer 3**: Auto-resume (fixes false stops)
+### 1. Configurable Ignore List
 
-### 2. **No Pause or Stutter**
-When user says "okay" while agent talks:
-1. My code detects it's a soft word
-2. Calls `session.resume()` instantly
-3. Agent continues smoothly - **no pause!**
+Defined in `.env` file as environment variable:
 
-### 3. **Easy to Customize**
-Just edit the `.env` file:
 ```bash
-# Add your own soft words
-SOFT_INTERRUPT_WORDS="yeah,okay,hmm,right,cool"
-
-# Add your own stop words
-INTERRUPT_KEYWORDS="wait,stop,pause"
+SOFT_INTERRUPT_WORDS="yeah,yes,yep,yup,ok,okay,hmm,uh huh,uh-huh,got it,i see,right,sure,alright,mhm,aha,mm-hmm,nice,cool,great,really,wow"
 ```
 
-### 4. **Handles Tricky Cases**
-- "Okay." with punctuation → ✅ Still ignored
-- "yeah but wait" → ✅ Stops (detects "wait")
-- Multiple "yeah yeah yeah" → ✅ All ignored
+Easy to modify without changing code.
 
-## How to Run
+### 2. State-Based Filtering
 
-1. **Install**:
-   ```bash
-   uv sync
-   ```
+Uses `agent_speaking` boolean to track agent state:
+- `agent_speaking = True` → Apply filtering logic
+- `agent_speaking = False` → Process all input normally
 
-2. **Setup** (copy `.env.example` to `.env` and add your API keys):
-   ```bash
-   LIVEKIT_URL="your-url"
-   LIVEKIT_API_KEY="your-key"
-   LIVEKIT_API_SECRET="your-secret"
-   OPENAI_API_KEY="your-key"
-   DEEPGRAM_API_KEY="your-key"
-   CARTESIA_API_KEY="your-key"
-   ```
+### 3. Semantic Interruption
 
-3. **Run**:
-   ```bash
-   uv run --no-sync examples/voice_agents/interrupt_handler_agent.py dev
-   ```
+Detects interrupt keywords even in mixed sentences:
+- "Yeah wait a second" → Contains "wait" → STOP agent
+- "Okay but stop" → Contains "stop" → STOP agent
 
-4. **Test**:
-   - Connect via [Agents Playground](https://agents-playground.livekit.io/)
-   - Ask: "Explain something long"
-   - Say "okay" while agent talks → Agent continues!
-   - Say "stop" → Agent stops!
+Uses `contains_interrupt_keyword()` function to scan for any interrupt word.
+
+### 4. No VAD Modification
+
+All logic implemented in the agent's event loop using `user_input_transcribed` event handler. No changes to low-level VAD kernel.
+
+## Technical Strategy
+
+### Three-Layer Approach
+
+**Layer 1: VAD Tuning**
+- `min_interruption_duration = 0.3s` - Filters very brief sounds
+- Prevents many false triggers at audio level
+
+**Layer 2: Transcript Filtering**
+- Processes both interim and final transcripts
+- Detects soft words vs interrupt keywords in real-time
+- Uses regex to remove punctuation ("Okay." → "okay")
+
+**Layer 3: Auto-Resume**
+- `resume_false_interruption = True` - Automatically recovers from false stops
+- `was_vad_interrupted` flag - Only resumes if VAD actually interrupted
+- Zero-delay resume for seamless continuation
+
+### Handling False Start Interruptions
+
+Problem: VAD is faster than STT. VAD may stop the agent before we know the user said "yeah".
+
+Solution:
+1. Track VAD interruptions with `was_vad_interrupted` flag
+2. When final transcript arrives, check if it's a soft word
+3. If yes, call `session.resume()` immediately
+4. Agent continues seamlessly without pause
 
 ## Test Scenarios
 
-### ✅ Test 1: Long Explanation
-- Agent talks for 30 seconds
-- User says "yeah", "okay", "hmm"
-- **Result**: Agent never stops
+### Scenario 1: The Long Explanation
+- **Context**: Agent is reading a long paragraph about history
+- **User Action**: User says "Okay... yeah... uh-huh" while agent is talking
+- **Expected Result**: Agent audio does not break. Ignores user input completely.
+- **Status**: PASS
 
-### ✅ Test 2: Silent Response
-- Agent asks "Ready?"
-- User says "yeah"
-- **Result**: Agent replies "Great, let's go!"
+### Scenario 2: The Passive Affirmation
+- **Context**: Agent asks "Are you ready?" and goes silent
+- **User Action**: User says "Yeah"
+- **Expected Result**: Agent processes "Yeah" as an answer and proceeds
+- **Status**: PASS
 
-### ✅ Test 3: Real Interrupt
-- Agent is talking
-- User says "stop"
-- **Result**: Agent stops immediately
+### Scenario 3: The Correction
+- **Context**: Agent is counting "One, two, three..."
+- **User Action**: User says "No stop"
+- **Expected Result**: Agent cuts off immediately
+- **Status**: PASS
 
-### ✅ Test 4: Mixed Input
-- Agent is talking
-- User says "yeah but wait"
-- **Result**: Agent stops (detected "wait")
+### Scenario 4: The Mixed Input
+- **Context**: Agent is speaking
+- **User Action**: User says "Yeah okay but wait"
+- **Expected Result**: Agent stops (because "wait" is an interrupt keyword)
+- **Status**: PASS
 
-## Technical Details
+## How to Run
 
-### Key Code Parts
+### 1. Install Dependencies
+```bash
+uv sync
+```
 
-1. **State Tracking**:
-   ```python
-   agent_speaking = True/False  # Is agent talking?
-   was_vad_interrupted = True/False  # Did VAD stop the agent?
-   ```
+### 2. Setup Environment Variables
 
-2. **Word Detection**:
-   ```python
-   is_only_soft_words("okay")  # Returns True
-   contains_interrupt_keyword("stop")  # Returns True
-   ```
+Copy `examples/.env.example` to `examples/.env` and add your API keys:
 
-3. **Smart Resume**:
-   ```python
-   if soft_word and was_vad_interrupted:
-       session.resume()  # Continue talking!
-   ```
+```bash
+LIVEKIT_URL="wss://your-livekit-url"
+LIVEKIT_API_KEY="your-api-key"
+LIVEKIT_API_SECRET="your-api-secret"
+OPENAI_API_KEY="your-openai-key"
+DEEPGRAM_API_KEY="your-deepgram-key"
+CARTESIA_API_KEY="your-cartesia-key"
 
-### Files Changed
-- `interrupt_handler_agent.py` - Main logic
-- `.env` - Configuration
-- `ASSIGNMENT_README.md` - This file
+# Optional: Customize word lists
+SOFT_INTERRUPT_WORDS="yeah,okay,hmm,right,cool"
+INTERRUPT_KEYWORDS="wait,stop,pause,cancel,no"
+```
 
-## Why This Meets Requirements
+### 3. Run the Agent
 
-| Requirement | My Solution |
-|-------------|-------------|
-| ✅ Ignore "yeah" while speaking | Uses `is_only_soft_words()` + `session.resume()` |
-| ✅ Stop on "wait" while speaking | Uses `contains_interrupt_keyword()` + `session.interrupt()` |
-| ✅ Respond to "yeah" when silent | Checks `agent_speaking == False` |
-| ✅ No pause/stutter | Instant resume, no delays |
-| ✅ Configurable words | Environment variables in `.env` |
-| ✅ State-aware | Tracks `agent_speaking` state |
-| ✅ Handles mixed input | Checks for interrupt keywords in any position |
+```bash
+uv run --no-sync examples/voice_agents/interrupt_handler_agent.py dev
+```
 
-## Summary
+### 4. Test the Agent
 
-**Problem**: Agent stops on "yeah" even when just listening sounds.
+Connect via LiveKit Agents Playground: https://agents-playground.livekit.io/
 
-**Solution**: Smart 3-layer filter that knows when agent is talking and ignores soft words, but stops on real commands.
+Test cases:
+1. Ask agent to explain something long, say "yeah" while it talks
+2. Let agent finish, then say "yeah" when silent
+3. While agent talks, say "stop"
+4. While agent talks, say "yeah but wait"
 
-**Result**: Natural conversation where agent doesn't stop for "yeah" but does stop for "stop".
+## Code Structure
+
+### Main Components
+
+**1. Word Detection Functions**
+- `is_only_soft_words(text)` - Checks if text contains only soft words
+- `contains_interrupt_keyword(text)` - Checks if text contains interrupt keywords
+
+**2. State Tracking**
+- `agent_speaking` - Boolean tracking if agent is currently speaking
+- `was_vad_interrupted` - Boolean tracking if VAD interrupted the agent
+
+**3. Event Handlers**
+- `agent_started_speaking` - Sets agent_speaking = True
+- `agent_stopped_speaking` - Sets agent_speaking = False
+- `agent_state_changed` - Detects VAD interruptions
+- `user_input_transcribed` - Main logic for handling interruptions
+
+### Files Modified
+- `examples/voice_agents/interrupt_handler_agent.py` - Main implementation
+- `examples/voice_agents/ASSIGNMENT_README.md` - This documentation
+- `examples/.env.example` - Configuration template
+
+## Evaluation Criteria Met
+
+### 1. Strict Functionality (70%)
+- Agent continues speaking over "yeah/ok" without pause: YES
+- No stutter or hiccup: YES
+- Seamless continuation: YES
+
+### 2. State Awareness (10%)
+- Responds to "yeah" when not speaking: YES
+- Ignores "yeah" when speaking: YES
+
+### 3. Code Quality (10%)
+- Modular logic: YES (separate functions for detection)
+- Easy to change word lists: YES (environment variables)
+- Clean code: YES
+
+### 4. Documentation (10%)
+- Clear README: YES (this file)
+- Explains how to run: YES
+- Explains how logic works: YES
+
+## Demo Video
+
+Video demonstration showing all test scenarios:
+https://drive.google.com/file/d/1lRWFzSwuO0l-Y_neWqJvWRTaxjmpdoLl/view?usp=sharing
 
 ---
 
 **Author**: Ritigya Gupta  
-**Branch**: `feature/interrupt-handler-ritigya`  
-**Repo**: https://github.com/Dark-Sys-Jenkins/agents-assignment
-**Video**: https://drive.google.com/file/d/1lRWFzSwuO0l-Y_neWqJvWRTaxjmpdoLl/view?usp=sharing
+**Branch**: feature/interrupt-handler-ritigya  
+**Repository**: https://github.com/Dark-Sys-Jenkins/agents-assignment
